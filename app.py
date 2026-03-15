@@ -13,6 +13,7 @@ import numpy  as np
 import streamlit as st
 from pathlib import Path
 from datetime import date
+from yard_parser import parse_yard_excel
 
 from config     import CONFIG
 from preprocess import get_feature_matrix, MODEL_FEATURES
@@ -562,10 +563,11 @@ st.markdown(f"""
 # ══════════════════════════════════════════════════════════════════════════════
 # TABS
 # ══════════════════════════════════════════════════════════════════════════════
-tab1, tab2, tab3, tab4 = st.tabs([
+tab1, tab2, tab3, tab4, tab5 = st.tabs([
     "📦  Shift Planner",
     "📅  Weekly Forecast",
     "📋  Shift Log",
+    "🏭  Yard Feed",
     "ℹ️  How It Works",
 ])
 
@@ -1012,9 +1014,165 @@ with tab3:
 
 
 # ┌─────────────────────────────────────────────────────────────────────────────
-# │  TAB 4 — HOW IT WORKS
+# │  TAB 4 — YARD FEED
 # └─────────────────────────────────────────────────────────────────────────────
 with tab4:
+
+    st.markdown(
+        "Upload your yard management Excel export to get an instant pallet stock "
+        "overview and a runout forecast. MomentumAI will tell you exactly how many "
+        "days of stock you have left — and whether you need to order today."
+    )
+    st.markdown("<br>", unsafe_allow_html=True)
+
+    # ── File uploader ─────────────────────────────────────────────────────────
+    yf_col1, yf_col2 = st.columns([2, 1], gap="large")
+    with yf_col1:
+        yard_file = st.file_uploader(
+            "Upload yard management Excel export (.xlsx)",
+            type=["xlsx", "xls"],
+            help="Copy your yard data into Excel and save as .xlsx, then upload here.",
+        )
+    with yf_col2:
+        yf_shifts_per_day = st.number_input(
+            "Shifts per day at your site", min_value=1, max_value=4, value=2,
+            help="Used to convert 'shifts remaining' into calendar days."
+        )
+        yf_avg_volume = st.number_input(
+            "Avg packages per shift", min_value=1_000, max_value=150_000,
+            value=int(target_volume), step=1_000,
+            help="Used to estimate pallet consumption per shift. Defaults to your Shift Planner volume."
+        )
+
+    st.markdown("<br>", unsafe_allow_html=True)
+
+    if yard_file is not None:
+        yard_bytes  = yard_file.read()
+        yard_result = parse_yard_excel(yard_bytes)
+
+        if yard_result["error"]:
+            st.error(f"❌ Could not parse file: {yard_result['error']}")
+
+        else:
+            # ── KPI chips ─────────────────────────────────────────────────────
+            wooden  = yard_result["wooden"]
+            plastic = yard_result["plastic"]
+            mixed   = yard_result["mixed"]
+            other   = yard_result["other"]
+            total   = yard_result["total"]
+            n_ships = yard_result["shipment_count"]
+
+            st.markdown(f"""
+            <div class="metric-row">
+              {metric_chip("🟫 Wooden Pallets",  wooden,  "#92400e")}
+              {metric_chip("🔵 Plastic Pallets", plastic, "#1d4ed8")}
+              {metric_chip("🟣 Mixed Type",      mixed,   "#7c3aed")}
+              {metric_chip("⚪ Other / BTS",     other,   "#475569")}
+              {metric_chip("📦 Total Stock",     total,   "#16a34a")}
+              {metric_chip("🚛 Shipments",       n_ships, "#0891b2")}
+            </div>
+            """, unsafe_allow_html=True)
+
+            # ── Runout forecast ───────────────────────────────────────────────
+            st.markdown("<br>", unsafe_allow_html=True)
+            st.markdown('<div class="section-label">📉 Runout Forecast</div>', unsafe_allow_html=True)
+            st.markdown('<div class="card">', unsafe_allow_html=True)
+
+            # Estimate pallets consumed per shift using current sidebar settings
+            _base_yf  = formula_pallets(yf_avg_volume)
+            _buf_yf   = spoilage_buffer(_base_yf, sb_spoilage_rate, shift_type, is_peak_season)
+            pallets_per_shift = max(1, _base_yf + _buf_yf)
+
+            if total == 0:
+                st.warning("⚠️ No pallets detected in the uploaded file. Check the file format.")
+            else:
+                shifts_remaining = total / pallets_per_shift
+                days_remaining   = shifts_remaining / yf_shifts_per_day
+
+                # Separate wooden/plastic runout (equal consumption split for now)
+                w_days = (wooden / pallets_per_shift / yf_shifts_per_day) if wooden > 0 else 0
+                p_days = (plastic / pallets_per_shift / yf_shifts_per_day) if plastic > 0 else 0
+                bottleneck_days = min(d for d in [w_days, p_days, days_remaining] if d > 0)
+
+                # Order deadline based on bottleneck
+                order_in_days = bottleneck_days - LEAD_PALLETS
+
+                rf_c1, rf_c2, rf_c3 = st.columns(3)
+                with rf_c1:
+                    st.metric("Pallets/Shift (est.)", pallets_per_shift)
+                    st.metric("🟫 Wooden runway", f"{w_days:.1f} days" if wooden else "—")
+                with rf_c2:
+                    st.metric("Shifts remaining", f"{shifts_remaining:.1f}")
+                    st.metric("🔵 Plastic runway", f"{p_days:.1f} days" if plastic else "—")
+                with rf_c3:
+                    st.metric("Total days of stock", f"{days_remaining:.1f}")
+                    st.metric("⏰ Order deadline", f"In {max(0, order_in_days):.1f} days")
+
+                st.markdown("<br>", unsafe_allow_html=True)
+
+                # ── Alert banner ──────────────────────────────────────────────
+                if order_in_days <= 0:
+                    st.error(
+                        f"🔴 **ORDER TODAY** — stock runs out in **{bottleneck_days:.1f} days** "
+                        f"and the lead time is {LEAD_PALLETS} days. You are already past the safe "
+                        f"order window. Place your order immediately."
+                    )
+                elif order_in_days <= 3:
+                    st.warning(
+                        f"🟡 **Order within {order_in_days:.0f} day(s)** — stock runs out in "
+                        f"**{bottleneck_days:.1f} days**. The {LEAD_PALLETS}-day lead time means "
+                        f"you must order by then to avoid a stockout."
+                    )
+                else:
+                    st.success(
+                        f"🟢 **Stock is healthy** — approximately **{bottleneck_days:.1f} days** "
+                        f"of pallets remaining. Next order due in ~{order_in_days:.0f} days."
+                    )
+
+            st.markdown('</div>', unsafe_allow_html=True)
+            st.markdown("<br>", unsafe_allow_html=True)
+
+            # ── Shipment table ────────────────────────────────────────────────
+            if yard_result["rows"]:
+                st.markdown('<div class="section-label">🚛 Parsed Shipments</div>', unsafe_allow_html=True)
+                yard_df = pd.DataFrame(yard_result["rows"])
+                st.dataframe(yard_df, use_container_width=True, hide_index=True)
+
+                # ── Type breakdown chart ──────────────────────────────────────
+                if total > 0:
+                    st.markdown("<br>", unsafe_allow_html=True)
+                    st.markdown('<div class="section-label">📊 Pallet Type Breakdown</div>',
+                                unsafe_allow_html=True)
+                    breakdown_df = pd.DataFrame({
+                        "Type":    ["Wooden", "Plastic", "Mixed", "Other / BTS"],
+                        "Pallets": [wooden,   plastic,   mixed,   other],
+                    }).query("Pallets > 0").set_index("Type")
+                    st.bar_chart(breakdown_df, color="#2563eb", use_container_width=True)
+            else:
+                st.info(
+                    "ℹ️ The file was read but no pallet descriptions were detected. "
+                    "Make sure the Notes/last column contains text like "
+                    "\"Pallet Storage 330 Wooden\" or \"Pallet Storage 300 Plastic\"."
+                )
+
+    else:
+        st.markdown("""
+        <div class="empty">
+          <div class="empty-icon">🏭</div>
+          <div class="empty-title">No file uploaded yet</div>
+          <div class="empty-body">
+            Export your yard management data to Excel, then upload it above.
+            MomentumAI will count your wooden and plastic pallet stock,
+            estimate how many shifts they cover, and tell you exactly when to reorder.
+          </div>
+        </div>
+        """, unsafe_allow_html=True)
+
+
+# ┌─────────────────────────────────────────────────────────────────────────────
+# │  TAB 5 — HOW IT WORKS
+# └─────────────────────────────────────────────────────────────────────────────
+with tab5:
 
     hw1, hw2 = st.columns(2, gap="large")
 
