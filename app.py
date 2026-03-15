@@ -12,9 +12,15 @@ import pandas as pd
 import numpy  as np
 import streamlit as st
 from pathlib import Path
+from datetime import date
 
 from config     import CONFIG
 from preprocess import get_feature_matrix, MODEL_FEATURES
+from db         import (init_db, log_shift, get_history,
+                        get_real_spoilage_rate, get_summary_stats, delete_shift)
+
+# Initialise database on every startup (safe — creates tables only if missing)
+init_db()
 
 # ══════════════════════════════════════════════════════════════════════════════
 # PAGE CONFIG
@@ -27,41 +33,65 @@ st.set_page_config(
 )
 
 # ══════════════════════════════════════════════════════════════════════════════
-# LOGO — SVG embedded as data URI (no external file needed)
-# Place momentum_logo.png in this folder to use your own PNG instead.
+# LOGO
+# Priority 1: momentum_logo.png in this folder  (your actual PNG)
+# Priority 2: built-in SVG fallback encoded as base64 (always works)
+#
+# To add your logo: copy momentum_logo.png into the same folder as app.py
 # ══════════════════════════════════════════════════════════════════════════════
-LOGO_SVG = """
-<svg width="52" height="52" viewBox="0 0 52 52" xmlns="http://www.w3.org/2000/svg">
-  <!-- Pallet body -->
-  <rect x="3"  y="33" width="36" height="7" rx="2" fill="#b45309"/>
-  <rect x="5"  y="29" width="8"  height="4" rx="1" fill="#92400e"/>
-  <rect x="17" y="29" width="8"  height="4" rx="1" fill="#92400e"/>
-  <rect x="29" y="29" width="8"  height="4" rx="1" fill="#92400e"/>
-  <rect x="3"  y="40" width="36" height="4" rx="1" fill="#92400e"/>
-  <!-- Top deck boards -->
-  <rect x="3"  y="27" width="36" height="2" rx="1" fill="#d97706" opacity="0.6"/>
-  <!-- Upward arrow -->
-  <defs>
-    <linearGradient id="ag" x1="0%" y1="100%" x2="60%" y2="0%">
-      <stop offset="0%"   stop-color="#f97316"/>
-      <stop offset="55%"  stop-color="#eab308"/>
-      <stop offset="100%" stop-color="#22c55e"/>
-    </linearGradient>
-  </defs>
-  <polygon points="24,4 34,22 28,22 28,32 20,32 20,22 14,22" fill="url(#ag)"/>
-  <!-- Brain / circuit (right) -->
-  <circle cx="43" cy="18" r="8"  fill="none" stroke="#2563eb" stroke-width="1.8" opacity="0.25"/>
-  <circle cx="43" cy="18" r="5"  fill="none" stroke="#2563eb" stroke-width="1.8"/>
-  <line   x1="40" y1="14" x2="46" y2="14" stroke="#2563eb" stroke-width="1.4" stroke-linecap="round"/>
-  <line   x1="39" y1="18" x2="47" y2="18" stroke="#2563eb" stroke-width="1.4" stroke-linecap="round"/>
-  <line   x1="40" y1="22" x2="46" y2="22" stroke="#2563eb" stroke-width="1.4" stroke-linecap="round"/>
-  <circle cx="38" cy="14" r="1.8" fill="#2563eb"/>
-  <circle cx="47" cy="18" r="1.8" fill="#2563eb"/>
-  <circle cx="38" cy="22" r="1.8" fill="#2563eb"/>
-</svg>
-"""
-LOGO_DATA_URI = f"data:image/svg+xml;utf8,{LOGO_SVG.replace(chr(10), '').replace(chr(34), '%22')}"
-LOGO_PNG      = Path("momentum_logo.png")
+import base64
+
+_SVG_RAW = """<svg width="120" height="120" viewBox="0 0 120 120" xmlns="http://www.w3.org/2000/svg">
+  <!-- 3D Pallet top face -->
+  <polygon points="10,72 70,72 80,62 20,62" fill="#d97706"/>
+  <!-- 3D Pallet front face -->
+  <rect x="10" y="72" width="60" height="10" rx="1" fill="#b45309"/>
+  <!-- Pallet legs -->
+  <rect x="13" y="82" width="10" height="8" rx="1" fill="#92400e"/>
+  <rect x="34" y="82" width="10" height="8" rx="1" fill="#92400e"/>
+  <rect x="55" y="82" width="10" height="8" rx="1" fill="#92400e"/>
+  <!-- Pallet bottom board -->
+  <rect x="10" y="88" width="60" height="5" rx="1" fill="#b45309"/>
+  <!-- Deck slat lines -->
+  <line x1="28" y1="62" x2="28" y2="72" stroke="#92400e" stroke-width="1.5"/>
+  <line x1="46" y1="62" x2="46" y2="72" stroke="#92400e" stroke-width="1.5"/>
+  <line x1="64" y1="62" x2="64" y2="72" stroke="#92400e" stroke-width="1.5"/>
+  <!-- Upward arrow body (orange base) -->
+  <polygon points="44,18 56,18 56,58 44,58" fill="#f97316"/>
+  <!-- Arrow gradient overlay (yellow in middle) -->
+  <polygon points="44,30 56,30 56,45 44,45" fill="#eab308"/>
+  <!-- Arrow head -->
+  <polygon points="35,22 50,4 65,22" fill="#65a30d"/>
+  <!-- Brain outline (right side) -->
+  <path d="M72,30 Q68,24 70,18 Q74,10 82,12 Q88,8 94,14 Q102,12 106,20 Q112,22 110,32 Q114,40 108,46 Q106,54 98,52 Q94,58 86,56 Q80,60 76,54 Q68,52 68,44 Q64,38 72,30 Z"
+        fill="#1d4ed8" opacity="0.15"/>
+  <path d="M72,30 Q68,24 70,18 Q74,10 82,12 Q88,8 94,14 Q102,12 106,20 Q112,22 110,32 Q114,40 108,46 Q106,54 98,52 Q94,58 86,56 Q80,60 76,54 Q68,52 68,44 Q64,38 72,30 Z"
+        fill="none" stroke="#2563eb" stroke-width="2.5"/>
+  <!-- Circuit lines -->
+  <line x1="80" y1="22" x2="96" y2="22" stroke="#2563eb" stroke-width="2" stroke-linecap="round"/>
+  <line x1="76" y1="32" x2="100" y2="32" stroke="#2563eb" stroke-width="2" stroke-linecap="round"/>
+  <line x1="78" y1="42" x2="98" y2="42" stroke="#2563eb" stroke-width="2" stroke-linecap="round"/>
+  <!-- Circuit dots -->
+  <circle cx="78"  cy="22" r="3.5" fill="#2563eb"/>
+  <circle cx="100" cy="32" r="3.5" fill="#2563eb"/>
+  <circle cx="78"  cy="42" r="3.5" fill="#2563eb"/>
+  <circle cx="100" cy="22" r="2.5" fill="#3b82f6"/>
+  <circle cx="76"  cy="32" r="2.5" fill="#3b82f6"/>
+  <circle cx="100" cy="42" r="2.5" fill="#3b82f6"/>
+</svg>"""
+
+# Encode SVG as base64 — works reliably in all browsers via <img src="data:...">
+_SVG_B64    = base64.b64encode(_SVG_RAW.encode()).decode()
+LOGO_B64_URI = f"data:image/svg+xml;base64,{_SVG_B64}"
+LOGO_PNG     = Path("momentum_logo.png")
+
+def get_logo_src(png_width=None):
+    """Return src string for the logo — PNG if available, SVG base64 otherwise."""
+    if LOGO_PNG.exists():
+        with open(LOGO_PNG, "rb") as f:
+            data = base64.b64encode(f.read()).decode()
+        return f"data:image/png;base64,{data}"
+    return LOGO_B64_URI
 
 # ══════════════════════════════════════════════════════════════════════════════
 # GLOBAL CSS  (light theme built on top of config.toml baseline)
@@ -430,15 +460,10 @@ def risk_card(level, title, body):
 # ══════════════════════════════════════════════════════════════════════════════
 with st.sidebar:
 
-    # Brand strip with logo
-    if LOGO_PNG.exists():
-        logo_html = f'<img src="momentum_logo.png" style="width:34px;height:34px;object-fit:contain;">'
-    else:
-        logo_html = LOGO_SVG.replace('width="52" height="52"', 'width="34" height="34"')
-
+    # Brand strip with logo (base64 encoded — works in all browsers)
     st.markdown(f"""
     <div class="sb-brand">
-      {logo_html}
+      <img src="{get_logo_src()}" style="width:42px;height:42px;object-fit:contain;flex-shrink:0;">
       <span class="sb-brand-name">MomentumAI</span>
     </div>
     """, unsafe_allow_html=True)
@@ -453,9 +478,34 @@ with st.sidebar:
         "Days to Order Deadline", min_value=0, max_value=14, value=5, step=1,
         help=f"Pallets must be ordered {LEAD_PALLETS} days in advance."
     )
+    # Use real spoilage rate from logged shifts if enough data exists
+    _real_rate, _n_shifts = get_real_spoilage_rate(min_shifts=3)
+    if _real_rate is not None:
+        _default_pct = max(1, min(20, round(_real_rate * 100)))
+        st.markdown(
+            f'<p style="font-size:0.72rem;color:#34d399;font-weight:600;margin:0 0 0.3rem;">'
+            f'✅ Using real data from {_n_shifts} logged shifts</p>',
+            unsafe_allow_html=True
+        )
+    else:
+        _default_pct = 6
+        if _n_shifts > 0:
+            st.markdown(
+                f'<p style="font-size:0.72rem;color:#94a3b8;margin:0 0 0.3rem;">'
+                f'📋 {_n_shifts}/3 shifts logged — keep going to unlock real rate</p>',
+                unsafe_allow_html=True
+            )
+        else:
+            st.markdown(
+                '<p style="font-size:0.72rem;color:#64748b;margin:0 0 0.3rem;">'
+                '📋 Log shifts to auto-calculate this</p>',
+                unsafe_allow_html=True
+            )
+
     sb_spoilage_pct = st.slider(
-        "Area Spoilage Rate", min_value=1, max_value=20, value=6, step=1, format="%d%%",
-        help="Your area's rolling damaged/unusable pallet percentage."
+        "Area Spoilage Rate", min_value=1, max_value=20,
+        value=_default_pct, step=1, format="%d%%",
+        help="Auto-filled from logged shift data once 3+ shifts recorded. You can still override manually."
     )
     sb_spoilage_rate = sb_spoilage_pct / 100.0
 
@@ -488,14 +538,11 @@ with st.sidebar:
 # ══════════════════════════════════════════════════════════════════════════════
 # PAGE HEADER  (dark banner — stays dark, good contrast on light page)
 # ══════════════════════════════════════════════════════════════════════════════
-if LOGO_PNG.exists():
-    _logo_in_header = f'<img src="momentum_logo.png" style="width:60px;height:60px;object-fit:contain;">'
-else:
-    _logo_in_header = LOGO_SVG
-
 st.markdown(f"""
 <div class="page-header">
-  <div class="header-logo">{_logo_in_header}</div>
+  <div class="header-logo">
+    <img src="{get_logo_src()}" style="width:70px;height:70px;object-fit:contain;">
+  </div>
   <div class="header-text">
     <div class="header-title">MomentumAI</div>
     <div class="header-sub">
@@ -515,9 +562,10 @@ st.markdown(f"""
 # ══════════════════════════════════════════════════════════════════════════════
 # TABS
 # ══════════════════════════════════════════════════════════════════════════════
-tab1, tab2, tab3 = st.tabs([
+tab1, tab2, tab3, tab4 = st.tabs([
     "📦  Shift Planner",
     "📅  Weekly Forecast",
+    "📋  Shift Log",
     "ℹ️  How It Works",
 ])
 
@@ -815,9 +863,158 @@ with tab2:
 
 
 # ┌─────────────────────────────────────────────────────────────────────────────
-# │  TAB 3 — HOW IT WORKS
+# │  TAB 3 — SHIFT LOG
 # └─────────────────────────────────────────────────────────────────────────────
 with tab3:
+
+    # ── Summary KPI chips ────────────────────────────────────────────────────
+    stats = get_summary_stats()
+
+    st.markdown("<br>", unsafe_allow_html=True)
+
+    if stats["total_shifts"] == 0:
+        st.markdown("""
+        <div class="empty">
+          <div class="empty-icon">📋</div>
+          <div class="empty-title">No shifts logged yet</div>
+          <div class="empty-body">
+            Use the form below to log your first completed shift.
+            After 3+ shifts the app will automatically use your real spoilage data
+            instead of the manual slider.
+          </div>
+        </div>
+        """, unsafe_allow_html=True)
+    else:
+        spoilage_display = (
+            f"{stats['spoilage_rate']*100:.1f}%"
+            if stats["spoilage_rate"] is not None else "—"
+        )
+        accuracy_display = (
+            f"{stats['avg_accuracy_pct']}%"
+            if stats["avg_accuracy_pct"] is not None else "—"
+        )
+        st.markdown(f"""
+        <div class="metric-row">
+          {metric_chip("Shifts Logged",   stats["total_shifts"],          "#2563eb")}
+          {metric_chip("Total Volume",    f"{stats['total_volume']:,}",   "#7c3aed")}
+          {metric_chip("Pallets Ordered", stats["total_ordered"],         "#16a34a")}
+          {metric_chip("Pallets Spoilt",  stats["total_spoilt"],          "#d97706")}
+          {metric_chip("Real Spoilage",   spoilage_display,               "#dc2626")}
+          {metric_chip("Pred Accuracy",   accuracy_display,               "#0891b2")}
+        </div>
+        """, unsafe_allow_html=True)
+
+        real_rate, n_shifts = get_real_spoilage_rate()
+        if real_rate is not None:
+            st.success(
+                f"✅ **Real spoilage rate active** — calculated from {n_shifts} logged shifts "
+                f"({real_rate*100:.1f}%). The sidebar slider has been replaced with this live figure."
+            )
+        else:
+            remaining = max(0, 3 - n_shifts)
+            st.info(
+                f"ℹ️ Log **{remaining} more shift(s)** to unlock automatic spoilage tracking. "
+                f"The sidebar slider is still active."
+            )
+
+    st.markdown("<br>", unsafe_allow_html=True)
+
+    # ── Log a shift form ─────────────────────────────────────────────────────
+    st.markdown('<div class="card">', unsafe_allow_html=True)
+    st.markdown('<div class="card-label">📝 Log a Completed Shift</div>', unsafe_allow_html=True)
+
+    with st.form("log_shift_form", clear_on_submit=True):
+        lf1, lf2, lf3 = st.columns(3)
+        with lf1:
+            log_date       = st.date_input("Shift Date", value=date.today())
+            log_shift_type = st.selectbox(
+                "Shift Type", ["morning", "afternoon", "night", "peak"],
+                format_func=lambda x: x.capitalize()
+            )
+        with lf2:
+            log_volume     = st.number_input("Target Volume (pkgs)", 1_000, 150_000, 35_000, 1_000)
+            log_ordered    = st.number_input("Pallets Ordered", 1, 500, 20)
+        with lf3:
+            log_spoilt     = st.number_input("Pallets Spoilt / Damaged", 0, 100, 1)
+            log_carts      = st.number_input("Carts Ordered", 0, 500, 10)
+
+        lf4, lf5 = st.columns(2)
+        with lf4:
+            log_peak_season = st.checkbox("Peak Season Shift?")
+            log_oversized   = st.checkbox("Had Oversized Items?")
+        with lf5:
+            log_notes = st.text_area("Notes (optional)", placeholder="e.g. delayed inbound, understaffed…", height=80)
+
+        submitted = st.form_submit_button("💾  Save Shift", use_container_width=True)
+
+    if submitted:
+        # Work out what the app would have predicted for this shift
+        _base_pred  = formula_pallets(log_volume)
+        _buf_pred   = spoilage_buffer(_base_pred, sb_spoilage_rate, log_shift_type, log_peak_season)
+        _pallet_pred = _base_pred + _buf_pred
+        _cart_pred   = formula_carts(log_volume)
+
+        log_shift(
+            shift_date        = log_date,
+            day_of_week       = log_date.strftime("%A"),
+            shift_type        = log_shift_type,
+            target_volume     = log_volume,
+            pallets_predicted = _pallet_pred,
+            carts_predicted   = _cart_pred,
+            pallets_ordered   = log_ordered,
+            pallets_spoilt    = log_spoilt,
+            carts_ordered     = log_carts,
+            is_peak_season    = log_peak_season,
+            has_oversized     = log_oversized,
+            notes             = log_notes,
+        )
+        st.success(f"✅ Shift logged for {log_date.strftime('%A %d %b %Y')}. Keep building your history!")
+        st.rerun()
+
+    st.markdown('</div>', unsafe_allow_html=True)
+    st.markdown("<br>", unsafe_allow_html=True)
+
+    # ── History table ─────────────────────────────────────────────────────────
+    history_df = get_history()
+
+    if not history_df.empty:
+        st.markdown('<div class="section-label">🗂️ Shift History</div>', unsafe_allow_html=True)
+
+        # Friendly display columns
+        display_df = history_df[[
+            "id", "shift_date", "day_of_week", "shift_type",
+            "target_volume", "pallets_predicted", "pallets_ordered",
+            "pallets_spoilt", "carts_ordered", "notes",
+        ]].copy()
+        display_df.columns = [
+            "ID", "Date", "Day", "Shift",
+            "Volume", "Predicted Pallets", "Ordered Pallets",
+            "Spoilt", "Carts Ordered", "Notes",
+        ]
+
+        st.dataframe(display_df, use_container_width=True, hide_index=True)
+
+        # ── Delete a row ──────────────────────────────────────────────────────
+        st.markdown("<br>", unsafe_allow_html=True)
+        with st.expander("🗑️  Delete a row (correct a mistake)"):
+            del_id = st.number_input(
+                "Enter the ID of the row to delete",
+                min_value=1, step=1,
+                help="The ID is shown in the leftmost column of the table above."
+            )
+            if st.button("Delete Row", type="secondary"):
+                if int(del_id) in history_df["id"].values:
+                    delete_shift(int(del_id))
+                    st.success(f"Row {int(del_id)} deleted.")
+                    st.rerun()
+                else:
+                    st.error(f"No row found with ID {int(del_id)}.")
+
+
+# ┌─────────────────────────────────────────────────────────────────────────────
+# │  TAB 4 — HOW IT WORKS
+# └─────────────────────────────────────────────────────────────────────────────
+with tab4:
 
     hw1, hw2 = st.columns(2, gap="large")
 
