@@ -12,7 +12,7 @@ import pandas as pd
 import numpy  as np
 import streamlit as st
 from pathlib import Path
-from datetime import date
+from datetime import date, datetime
 from yard_parser import parse_yard_excel
 
 from config     import CONFIG
@@ -22,6 +22,11 @@ from db         import (init_db, log_shift, get_history,
 
 # Initialise database on every startup (safe — creates tables only if missing)
 init_db()
+
+# ── Session state: live volume tracker ───────────────────────────────────────
+if "live_volume" not in st.session_state:
+    st.session_state.live_volume       = 18_000
+    st.session_state.live_volume_time  = None   # None = never updated manually
 
 # ══════════════════════════════════════════════════════════════════════════════
 # PAGE CONFIG
@@ -561,6 +566,54 @@ st.markdown(f"""
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# LIVE VOLUME BAR  — always visible, updates feed into all tabs
+# ══════════════════════════════════════════════════════════════════════════════
+with st.container():
+    lv_left, lv_mid, lv_right = st.columns([1.6, 1, 1], gap="small")
+
+    with lv_left:
+        # Timestamp label
+        if st.session_state.live_volume_time:
+            _ts = st.session_state.live_volume_time.strftime("%H:%M")
+            _label = f"🟢 Live Volume — last updated at {_ts}"
+        else:
+            _label = "📦 Current Shift Volume — enter below to update all predictions"
+        st.markdown(
+            f'<p style="margin:0.35rem 0 0.1rem;font-size:0.8rem;'
+            f'color:#64748b;font-weight:600;">{_label}</p>',
+            unsafe_allow_html=True,
+        )
+        # Big volume display
+        st.markdown(
+            f'<p style="margin:0;font-size:2rem;font-weight:800;color:#2563eb;'
+            f'line-height:1.1;">{st.session_state.live_volume:,} <span style="'
+            f'font-size:1rem;color:#94a3b8;font-weight:500;">packages</span></p>',
+            unsafe_allow_html=True,
+        )
+
+    with lv_mid:
+        st.markdown("<br>", unsafe_allow_html=True)
+        new_vol = st.number_input(
+            "New volume",
+            min_value=500, max_value=150_000,
+            value=st.session_state.live_volume,
+            step=500,
+            label_visibility="collapsed",
+            key="lv_input",
+        )
+
+    with lv_right:
+        st.markdown("<br>", unsafe_allow_html=True)
+        if st.button("🔄  Update Volume", use_container_width=True, type="primary"):
+            st.session_state.live_volume      = new_vol
+            st.session_state.live_volume_time = datetime.now()
+            st.rerun()
+
+st.markdown("<hr style='margin:0.5rem 0 1rem;border-color:#e2e8f0;'>",
+            unsafe_allow_html=True)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # TABS
 # ══════════════════════════════════════════════════════════════════════════════
 tab1, tab2, tab3, tab4, tab5 = st.tabs([
@@ -586,8 +639,10 @@ with tab1:
 
         target_volume = st.number_input(
             "📦 Target Volume (packages)",
-            min_value=500, max_value=100_000, value=18_000, step=500,
-            help="Total packages expected to be processed this shift."
+            min_value=500, max_value=150_000,
+            value=st.session_state.live_volume,
+            step=500,
+            help="Automatically filled from the Live Volume bar above. Change here to override for this prediction only."
         )
 
         # Live formula preview
