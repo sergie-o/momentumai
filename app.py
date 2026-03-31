@@ -13,7 +13,19 @@ import numpy  as np
 import streamlit as st
 from pathlib import Path
 from datetime import date, datetime
+from io import BytesIO
 from yard_parser import parse_yard_excel
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import OneHotEncoder
+from sklearn.impute import SimpleImputer
+from sklearn.ensemble import RandomForestRegressor
+
+try:
+    from xgboost import XGBRegressor
+    HAS_XGB = True
+except Exception:
+    HAS_XGB = False
 
 from config     import CONFIG
 from preprocess import get_feature_matrix, MODEL_FEATURES
@@ -461,6 +473,422 @@ def risk_card(level, title, body):
     </div>"""
 
 
+# ── Lane forecast helpers ─────────────────────────────────────────────────────
+def load_lane_file(uploaded_file):
+    name = uploaded_file.name.lower()
+    if name.endswith(".csv"):
+        file_bytes = uploaded_file.getvalue()
+        last_err = None
+        for sep in [';', ',', '	', '|']:
+            try:
+                df = pd.read_csv(pd.io.common.BytesIO(file_bytes), sep=sep, low_memory=False, on_bad_lines="skip")
+                if len(df.columns) > 1:
+                    return df
+            except Exception as e:
+                last_err = e
+        if last_err:
+            raise last_err
+        raise ValueError("Could not parse uploaded CSV file.")
+    return pd.read_excel(uploaded_file)
+
+
+def build_weekly_lane_summary(df: pd.DataFrame, date_col: str = "First Dock Arrival") -> pd.DataFrame:
+    required_columns = ["Lane", date_col, "Carts", "Pallets", "Gaylords"]
+    missing_columns = [col for col in required_columns if col not in df.columns]
+    if missing_columns:
+        raise ValueError(f"Missing required columns: {missing_columns}")
+
+    df = df.copy()
+    df["Lane"] = df["Lane"].astype(str).str.strip()
+    df = df[df["Lane"].str.startswith("SCN2", na=False)].copy()
+
+    df[date_col] = pd.to_datetime(df[date_col], errors="coerce", dayfirst=True)
+    df = df.dropna(subset=[date_col])
+
+    iso = df[date_col].dt.isocalendar()
+    df["Year"] = iso.year
+    df["Calendar_Week"] = iso.week
+
+    df["Week_Start"] = (
+        df[date_col] - pd.to_timedelta(df[date_col].dt.weekday, unit="d")
+    ).dt.normalize()
+    df["Week_End"] = df["Week_Start"] + pd.to_timedelta(6, unit="d")
+    df["Week_Label"] = (
+        df["Week_Start"].dt.strftime("%d.%m.%Y") + " - " + df["Week_End"].dt.strftime("%d.%m.%Y")
+    )
+
+    for col in ["Carts", "Pallets", "Gaylords"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
+
+    weekly_summary = df.groupby(["Year", "Calendar_Week", "Week_Label", "Lane"], as_index=False).agg(
+        Number_of_times_Per_Week=("Lane", "size"),
+        Carts_Per_Week=("Carts", "sum"),
+        Pallets_Per_Week=("Pallets", "sum"),
+        Gaylords_Per_Week=("Gaylords", "sum"),
+    )
+
+    weekly_summary = weekly_summary[[
+        "Year", "Calendar_Week", "Week_Label", "Lane",
+        "Number_of_times_Per_Week", "Carts_Per_Week", "Pallets_Per_Week", "Gaylords_Per_Week"
+    ]].sort_values(by=["Year", "Calendar_Week", "Lane"]).reset_index(drop=True)
+    return weekly_summary
+
+
+def build_lane_pattern_summary(weekly_summary: pd.DataFrame) -> pd.DataFrame:
+    pattern_summary = weekly_summary.groupby("Lane", as_index=False).agg(
+        Active_Weeks=("Calendar_Week", "count"),
+        Average_Trips_Per_Week=("Number_of_times_Per_Week", "mean"),
+        Average_Carts_Per_Week=("Carts_Per_Week", "mean"),
+        Average_Pallets_Per_Week=("Pallets_Per_Week", "mean"),
+        Average_Gaylords_Per_Week=("Gaylords_Per_Week", "mean"),
+    )
+    avg_cols = [
+        "Average_Trips_Per_Week", "Average_Carts_Per_Week",
+        "Average_Pallets_Per_Week", "Average_Gaylords_Per_Week"
+    ]
+    for col in avg_cols:
+        pattern_summary[col] = pattern_summary[col].apply(lambda x: math.ceil(x) if pd.notna(x) else x)
+    return pattern_summary.sort_values(by=["Active_Weeks", "Average_Trips_Per_Week"], ascending=[False, False]).reset_index(drop=True)
+
+
+def predict_next_week_lane_needs(weekly_summary: pd.DataFrame, lookback: int = 3) -> pd.DataFrame:
+    preds = []
+    sorted_df = weekly_summary.sort_values(by=["Lane", "Year", "Calendar_Week"]).copy()
+    for lane, group in sorted_df.groupby("Lane"):
+        tail = group.tail(lookback)
+        preds.append({
+            "Lane": lane,
+            "Predicted_Trips_Next_Week_Baseline": math.ceil(tail["Number_of_times_Per_Week"].mean()),
+            "Predicted_Carts_Next_Week_Baseline": math.ceil(tail["Carts_Per_Week"].mean()),
+            "Predicted_Pallets_Next_Week_Baseline": math.ceil(tail["Pallets_Per_Week"].mean()),
+            "Predicted_Gaylords_Next_Week_Baseline": math.ceil(tail["Gaylords_Per_Week"].mean()),
+        })
+    return pd.DataFrame(preds).sort_values("Lane").reset_index(drop=True)
+
+
+def add_cyclical_week_features(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    df["week_sin"] = np.sin(2 * np.pi * df["Calendar_Week"] / 52.0)
+    df["week_cos"] = np.cos(2 * np.pi * df["Calendar_Week"] / 52.0)
+    return df
+
+
+def add_lane_history_features(weekly: pd.DataFrame) -> pd.DataFrame:
+    weekly = weekly.copy()
+    weekly = weekly.sort_values(["Lane", "Year", "Calendar_Week"]).reset_index(drop=True)
+
+    target_cols = [
+        "Number_of_times_Per_Week",
+        "Carts_Per_Week",
+        "Pallets_Per_Week",
+        "Gaylords_Per_Week"
+    ]
+
+    for col in target_cols:
+        weekly[f"{col}_lag1"] = weekly.groupby("Lane")[col].shift(1)
+        weekly[f"{col}_lag2"] = weekly.groupby("Lane")[col].shift(2)
+        weekly[f"{col}_lag3"] = weekly.groupby("Lane")[col].shift(3)
+
+        weekly[f"{col}_roll3_mean"] = (
+            weekly.groupby("Lane")[col]
+            .transform(lambda s: s.shift(1).rolling(3, min_periods=1).mean())
+        )
+        weekly[f"{col}_roll3_std"] = (
+            weekly.groupby("Lane")[col]
+            .transform(lambda s: s.shift(1).rolling(3, min_periods=1).std())
+        )
+
+    weekly["Active_Weeks_So_Far"] = weekly.groupby("Lane").cumcount()
+    weekly = add_cyclical_week_features(weekly)
+    return weekly
+
+
+def add_anomaly_flags(weekly: pd.DataFrame) -> pd.DataFrame:
+    weekly = weekly.copy()
+    cols = [
+        "Number_of_times_Per_Week",
+        "Carts_Per_Week",
+        "Pallets_Per_Week",
+        "Gaylords_Per_Week"
+    ]
+
+    for col in cols:
+        med = weekly.groupby("Lane")[col].transform("median")
+        mad = weekly.groupby("Lane")[col].transform(
+            lambda s: np.median(np.abs(s - np.median(s))) if len(s) else 0
+        )
+        mad = mad.replace(0, 1)
+        robust_z = np.abs((weekly[col] - med) / mad)
+        weekly[f"{col}_anomaly_flag"] = (robust_z > 3).astype(int)
+
+    return weekly
+
+
+def build_lane_intelligence_dashboard(weekly_summary: pd.DataFrame):
+    df = weekly_summary.copy()
+
+    metric_cols = [
+        "Number_of_times_Per_Week",
+        "Carts_Per_Week",
+        "Pallets_Per_Week",
+        "Gaylords_Per_Week",
+    ]
+
+    anomaly_df = df.copy()
+    for col in metric_cols:
+        med = anomaly_df.groupby("Lane")[col].transform("median")
+        mad = anomaly_df.groupby("Lane")[col].transform(
+            lambda s: np.median(np.abs(s - np.median(s))) if len(s) else 0
+        )
+        mad = mad.replace(0, 1)
+        robust_z = np.abs((anomaly_df[col] - med) / mad)
+        anomaly_df[f"{col}_anomaly_flag"] = (robust_z > 3).astype(int)
+
+    anomaly_flag_cols = [f"{col}_anomaly_flag" for col in metric_cols]
+    anomaly_df["Any_Anomaly"] = anomaly_df[anomaly_flag_cols].max(axis=1)
+
+    lane_summary = df.groupby("Lane", as_index=False).agg(
+        Active_Weeks=("Calendar_Week", "count"),
+        Average_Trips_Per_Week=("Number_of_times_Per_Week", "mean"),
+        Average_Carts_Per_Week=("Carts_Per_Week", "mean"),
+        Average_Pallets_Per_Week=("Pallets_Per_Week", "mean"),
+        Average_Gaylords_Per_Week=("Gaylords_Per_Week", "mean"),
+        Trips_Std=("Number_of_times_Per_Week", "std"),
+        Carts_Std=("Carts_Per_Week", "std"),
+        Pallets_Std=("Pallets_Per_Week", "std"),
+        Gaylords_Std=("Gaylords_Per_Week", "std"),
+    )
+
+    std_cols = ["Trips_Std", "Carts_Std", "Pallets_Std", "Gaylords_Std"]
+    lane_summary[std_cols] = lane_summary[std_cols].fillna(0)
+
+    lane_summary["Trips_CV"] = lane_summary["Trips_Std"] / lane_summary["Average_Trips_Per_Week"].replace(0, np.nan)
+    lane_summary["Carts_CV"] = lane_summary["Carts_Std"] / lane_summary["Average_Carts_Per_Week"].replace(0, np.nan)
+    lane_summary["Pallets_CV"] = lane_summary["Pallets_Std"] / lane_summary["Average_Pallets_Per_Week"].replace(0, np.nan)
+    lane_summary["Gaylords_CV"] = lane_summary["Gaylords_Std"] / lane_summary["Average_Gaylords_Per_Week"].replace(0, np.nan)
+
+    lane_summary[["Trips_CV", "Carts_CV", "Pallets_CV", "Gaylords_CV"]] = (
+        lane_summary[["Trips_CV", "Carts_CV", "Pallets_CV", "Gaylords_CV"]].fillna(0)
+    )
+
+    anomaly_counts = (
+        anomaly_df.groupby("Lane", as_index=False)["Any_Anomaly"]
+        .sum()
+        .rename(columns={"Any_Anomaly": "Anomaly_Weeks"})
+    )
+
+    lane_summary = lane_summary.merge(anomaly_counts, on="Lane", how="left")
+    lane_summary["Anomaly_Weeks"] = lane_summary["Anomaly_Weeks"].fillna(0).astype(int)
+
+    lane_summary["Repetitive_Flag"] = (
+        (lane_summary["Active_Weeks"] >= 4) &
+        (lane_summary["Trips_CV"] <= 0.30)
+    ).map({True: "Yes", False: "No"})
+
+    lane_summary["Stability_Score"] = (
+        100
+        - (lane_summary["Trips_CV"].clip(0, 1) * 40)
+        - (lane_summary["Pallets_CV"].clip(0, 1) * 20)
+        - (lane_summary["Carts_CV"].clip(0, 1) * 20)
+        - (lane_summary["Gaylords_CV"].clip(0, 1) * 20)
+    ).clip(lower=0).round(0).astype(int)
+
+    avg_cols = [
+        "Average_Trips_Per_Week",
+        "Average_Carts_Per_Week",
+        "Average_Pallets_Per_Week",
+        "Average_Gaylords_Per_Week",
+    ]
+    for col in avg_cols:
+        lane_summary[col] = lane_summary[col].apply(lambda x: math.ceil(x) if pd.notna(x) else x)
+
+    cv_cols = ["Trips_CV", "Carts_CV", "Pallets_CV", "Gaylords_CV"]
+    lane_summary[cv_cols] = lane_summary[cv_cols].round(2)
+    lane_summary[std_cols] = lane_summary[std_cols].round(2)
+
+    lane_summary = lane_summary.sort_values(
+        ["Stability_Score", "Active_Weeks"],
+        ascending=[False, False]
+    ).reset_index(drop=True)
+
+    anomaly_rows = anomaly_df[anomaly_df["Any_Anomaly"] == 1].copy()
+    anomaly_rows = anomaly_rows.sort_values(["Year", "Calendar_Week", "Lane"]).reset_index(drop=True)
+
+    return lane_summary, anomaly_rows
+
+
+def build_ml_training_table(weekly_summary: pd.DataFrame) -> pd.DataFrame:
+    df = weekly_summary.copy()
+    df = add_lane_history_features(df)
+    df = add_anomaly_flags(df)
+
+    df["target_trips_next"] = df.groupby("Lane")["Number_of_times_Per_Week"].shift(-1)
+    df["target_carts_next"] = df.groupby("Lane")["Carts_Per_Week"].shift(-1)
+    df["target_pallets_next"] = df.groupby("Lane")["Pallets_Per_Week"].shift(-1)
+    df["target_gaylords_next"] = df.groupby("Lane")["Gaylords_Per_Week"].shift(-1)
+
+    df = df.dropna(subset=[
+        "target_trips_next",
+        "target_carts_next",
+        "target_pallets_next",
+        "target_gaylords_next"
+    ]).reset_index(drop=True)
+
+    return df
+
+
+def make_regressor():
+    if HAS_XGB:
+        return XGBRegressor(
+            n_estimators=250,
+            max_depth=4,
+            learning_rate=0.05,
+            subsample=0.9,
+            colsample_bytree=0.9,
+            objective="reg:squarederror",
+            random_state=42,
+        )
+    return RandomForestRegressor(
+        n_estimators=300,
+        max_depth=10,
+        random_state=42,
+        n_jobs=-1,
+    )
+
+
+def train_lane_models(weekly_summary: pd.DataFrame):
+    training_df = build_ml_training_table(weekly_summary)
+
+    feature_cols = [
+        "Lane",
+        "Year",
+        "Calendar_Week",
+        "week_sin",
+        "week_cos",
+        "Active_Weeks_So_Far",
+        "Number_of_times_Per_Week_lag1",
+        "Number_of_times_Per_Week_lag2",
+        "Number_of_times_Per_Week_lag3",
+        "Number_of_times_Per_Week_roll3_mean",
+        "Number_of_times_Per_Week_roll3_std",
+        "Carts_Per_Week_lag1",
+        "Carts_Per_Week_lag2",
+        "Carts_Per_Week_lag3",
+        "Carts_Per_Week_roll3_mean",
+        "Carts_Per_Week_roll3_std",
+        "Pallets_Per_Week_lag1",
+        "Pallets_Per_Week_lag2",
+        "Pallets_Per_Week_lag3",
+        "Pallets_Per_Week_roll3_mean",
+        "Pallets_Per_Week_roll3_std",
+        "Gaylords_Per_Week_lag1",
+        "Gaylords_Per_Week_lag2",
+        "Gaylords_Per_Week_lag3",
+        "Gaylords_Per_Week_roll3_mean",
+        "Gaylords_Per_Week_roll3_std",
+        "Number_of_times_Per_Week_anomaly_flag",
+        "Carts_Per_Week_anomaly_flag",
+        "Pallets_Per_Week_anomaly_flag",
+        "Gaylords_Per_Week_anomaly_flag",
+    ]
+
+    categorical_cols = ["Lane"]
+    numeric_cols = [c for c in feature_cols if c not in categorical_cols]
+
+    preprocessor = ColumnTransformer(
+        transformers=[
+            (
+                "cat",
+                Pipeline([
+                    ("imputer", SimpleImputer(strategy="most_frequent")),
+                    ("onehot", OneHotEncoder(handle_unknown="ignore")),
+                ]),
+                categorical_cols,
+            ),
+            (
+                "num",
+                Pipeline([
+                    ("imputer", SimpleImputer(strategy="median")),
+                ]),
+                numeric_cols,
+            ),
+        ]
+    )
+
+    targets = {
+        "trips": "target_trips_next",
+        "carts": "target_carts_next",
+        "pallets": "target_pallets_next",
+        "gaylords": "target_gaylords_next",
+    }
+
+    X = training_df[feature_cols]
+    models = {}
+
+    for key, target_col in targets.items():
+        pipe = Pipeline([
+            ("preprocessor", preprocessor),
+            ("model", make_regressor()),
+        ])
+        pipe.fit(X, training_df[target_col])
+        models[key] = pipe
+
+    return models, feature_cols
+
+
+def build_next_week_feature_rows(weekly_summary: pd.DataFrame) -> pd.DataFrame:
+    hist = add_lane_history_features(weekly_summary.copy())
+    hist = add_anomaly_flags(hist)
+
+    latest = (
+        hist.sort_values(["Lane", "Year", "Calendar_Week"])
+        .groupby("Lane")
+        .tail(1)
+        .copy()
+    )
+
+    latest["Calendar_Week"] = latest["Calendar_Week"] + 1
+    overflow_mask = latest["Calendar_Week"] > 52
+    latest.loc[overflow_mask, "Calendar_Week"] = 1
+    latest.loc[overflow_mask, "Year"] = latest.loc[overflow_mask, "Year"] + 1
+
+    latest = add_cyclical_week_features(latest)
+    return latest
+
+
+def predict_next_week_ml(weekly_summary: pd.DataFrame) -> pd.DataFrame:
+    if len(weekly_summary) < 8:
+        return pd.DataFrame(columns=[
+            "Lane",
+            "Predicted_Trips_Next_Week_ML",
+            "Predicted_Carts_Next_Week_ML",
+            "Predicted_Pallets_Next_Week_ML",
+            "Predicted_Gaylords_Next_Week_ML",
+        ])
+
+    models, feature_cols = train_lane_models(weekly_summary)
+    next_rows = build_next_week_feature_rows(weekly_summary)
+    X_next = next_rows[feature_cols].copy()
+
+    preds = pd.DataFrame({
+        "Lane": next_rows["Lane"].values,
+        "Predicted_Trips_Next_Week_ML": np.ceil(models["trips"].predict(X_next)).astype(int),
+        "Predicted_Carts_Next_Week_ML": np.ceil(models["carts"].predict(X_next)).astype(int),
+        "Predicted_Pallets_Next_Week_ML": np.ceil(models["pallets"].predict(X_next)).astype(int),
+        "Predicted_Gaylords_Next_Week_ML": np.ceil(models["gaylords"].predict(X_next)).astype(int),
+    })
+
+    for col in preds.columns:
+        if col != "Lane":
+            preds[col] = preds[col].clip(lower=0)
+
+    return preds.sort_values("Lane").reset_index(drop=True)
+
+
+def to_csv_download(df: pd.DataFrame) -> bytes:
+    return df.to_csv(index=False).encode("utf-8")
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # SIDEBAR
 # ══════════════════════════════════════════════════════════════════════════════
@@ -616,12 +1044,13 @@ st.markdown("<hr style='margin:0.5rem 0 1rem;border-color:#e2e8f0;'>",
 # ══════════════════════════════════════════════════════════════════════════════
 # TABS
 # ══════════════════════════════════════════════════════════════════════════════
-tab1, tab2, tab3, tab4, tab5 = st.tabs([
+tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
     "📦  Shift Planner",
     "📅  Weekly Forecast",
     "📋  Shift Log",
     "🏭  Yard Feed",
     "ℹ️  How It Works",
+    "🚚  Lane Forecast",
 ])
 
 
@@ -1319,3 +1748,184 @@ Pallets are the primary problem — the **{LEAD_PALLETS}-day lead time** leaves 
       <div><div class="ref-label">Min Buffer</div><div class="ref-value">+{CONFIG['min_extra_pallets']} pallets</div></div>
     </div>
     """, unsafe_allow_html=True)
+
+
+# ┌─────────────────────────────────────────────────────────────────────────────
+# │  TAB 6 — LANE FORECAST
+# └─────────────────────────────────────────────────────────────────────────────
+with tab6:
+    st.markdown("Upload a historical SCN2 lane file to generate a weekly summary, pattern summary, and next-week lane predictions.")
+
+    st.markdown('<div class="card">', unsafe_allow_html=True)
+    st.markdown('<div class="card-label">🚚 Lane Forecast Pipeline</div>', unsafe_allow_html=True)
+
+    lf1, lf2 = st.columns([1, 1])
+    with lf1:
+        lane_file = st.file_uploader(
+            "Upload lane history file (.csv or .xlsx)",
+            type=["csv", "xlsx", "xls"],
+            key="lane_forecast_uploader"
+        )
+    with lf2:
+        date_basis = st.selectbox(
+            "Date basis for weekly grouping",
+            ["First Dock Arrival", "Last Dock Arrival"],
+            index=0,
+            key="lane_date_basis"
+        )
+
+    lookback = st.slider(
+        "Baseline predictor lookback window (weeks)",
+        min_value=2,
+        max_value=8,
+        value=3,
+        step=1,
+        key="lane_lookback"
+    )
+
+    st.markdown('</div>', unsafe_allow_html=True)
+    st.markdown("<br>", unsafe_allow_html=True)
+
+    if lane_file is None:
+        st.markdown("""
+        <div class="empty">
+          <div class="empty-icon">🚚</div>
+          <div class="empty-title">Upload a historical lane file</div>
+          <div class="empty-body">
+            MomentumAI will process the uploaded file into a weekly lane summary,
+            learn lane patterns, and estimate next week's carts, pallets, and gaylords.
+          </div>
+        </div>
+        """, unsafe_allow_html=True)
+    else:
+        try:
+            raw_lane_df = load_lane_file(lane_file)
+            weekly_lane_summary = build_weekly_lane_summary(raw_lane_df, date_col=date_basis)
+            lane_pattern_summary = build_lane_pattern_summary(weekly_lane_summary)
+            baseline_predictions = predict_next_week_lane_needs(weekly_lane_summary, lookback=lookback)
+            ml_predictions = predict_next_week_ml(weekly_lane_summary)
+
+            c1, c2, c3, c4 = st.columns(4)
+            with c1:
+                st.metric("Weekly Rows", f"{len(weekly_lane_summary):,}")
+            with c2:
+                st.metric("Unique Lanes", f"{weekly_lane_summary['Lane'].nunique():,}")
+            with c3:
+                st.metric("Pattern Rows", f"{len(lane_pattern_summary):,}")
+            with c4:
+                st.metric("Baseline Rows", f"{len(baseline_predictions):,}")
+
+            st.markdown('<div class="section-label">📊 Weekly Summary</div>', unsafe_allow_html=True)
+            st.dataframe(weekly_lane_summary, use_container_width=True, hide_index=True)
+            st.download_button(
+                "⬇️ Download Weekly Summary CSV",
+                to_csv_download(weekly_lane_summary),
+                file_name=f"weekly_lane_summary_{date_basis.replace(' ', '_').lower()}.csv",
+                mime="text/csv",
+                use_container_width=True,
+                key="dl_weekly_summary"
+            )
+
+            st.markdown("<br>", unsafe_allow_html=True)
+            st.markdown('<div class="section-label">📈 Pattern Summary</div>', unsafe_allow_html=True)
+            st.dataframe(lane_pattern_summary, use_container_width=True, hide_index=True)
+            st.download_button(
+                "⬇️ Download Pattern Summary CSV",
+                to_csv_download(lane_pattern_summary),
+                file_name="lane_pattern_summary.csv",
+                mime="text/csv",
+                use_container_width=True,
+                key="dl_pattern_summary"
+            )
+
+            st.markdown("<br>", unsafe_allow_html=True)
+            st.markdown('<div class="section-label">🔮 Baseline Predictions</div>', unsafe_allow_html=True)
+            st.caption("Baseline predictor = rolling average of the last selected weeks, rounded up.")
+            st.dataframe(baseline_predictions, use_container_width=True, hide_index=True)
+            st.download_button(
+                "⬇️ Download Baseline Predictions CSV",
+                to_csv_download(baseline_predictions),
+                file_name="lane_predictions_next_week_baseline.csv",
+                mime="text/csv",
+                use_container_width=True,
+                key="dl_lane_predictions_baseline"
+            )
+
+            st.markdown("<br>", unsafe_allow_html=True)
+            st.markdown('<div class="section-label">🤖 ML Predictions</div>', unsafe_allow_html=True)
+            st.caption("ML predictor uses lag features, rolling features, seasonality, and anomaly flags. Predictions are rounded up to whole units.")
+            if ml_predictions.empty:
+                st.warning("Not enough weekly history to train the ML predictor yet. Upload more historical weeks and try again.")
+            else:
+                st.dataframe(ml_predictions, use_container_width=True, hide_index=True)
+                st.download_button(
+                    "⬇️ Download ML Predictions CSV",
+                    to_csv_download(ml_predictions),
+                    file_name="lane_predictions_next_week_ml.csv",
+                    mime="text/csv",
+                    use_container_width=True,
+                    key="dl_lane_predictions_ml"
+                )
+
+            st.markdown("<br>", unsafe_allow_html=True)
+            st.markdown('<div class="section-label">🆚 Predictor Comparison</div>', unsafe_allow_html=True)
+            if ml_predictions.empty:
+                comparison = baseline_predictions.copy()
+            else:
+                comparison = baseline_predictions.merge(ml_predictions, on="Lane", how="outer")
+            st.dataframe(comparison, use_container_width=True, hide_index=True)
+            st.download_button(
+                "⬇️ Download Predictor Comparison CSV",
+                to_csv_download(comparison),
+                file_name="lane_predictions_comparison.csv",
+                mime="text/csv",
+                use_container_width=True,
+                key="dl_lane_predictions_comparison"
+            )
+
+            lane_dashboard, anomaly_rows = build_lane_intelligence_dashboard(weekly_lane_summary)
+
+            st.markdown("<br>", unsafe_allow_html=True)
+            st.markdown('<div class="section-label">🚨 Lane Anomaly & Pattern Dashboard</div>', unsafe_allow_html=True)
+            st.dataframe(lane_dashboard, use_container_width=True, hide_index=True)
+            st.download_button(
+                "⬇️ Download Lane Intelligence CSV",
+                to_csv_download(lane_dashboard),
+                file_name="lane_intelligence_dashboard.csv",
+                mime="text/csv",
+                use_container_width=True,
+                key="dl_lane_intelligence"
+            )
+
+            st.markdown("<br>", unsafe_allow_html=True)
+            st.markdown('<div class="section-label">⚠️ Weekly Anomaly Rows</div>', unsafe_allow_html=True)
+            if anomaly_rows.empty:
+                st.success("No anomalies detected based on the current rules.")
+            else:
+                anomaly_display_cols = [
+                    "Year",
+                    "Calendar_Week",
+                    "Week_Label",
+                    "Lane",
+                    "Number_of_times_Per_Week",
+                    "Carts_Per_Week",
+                    "Pallets_Per_Week",
+                    "Gaylords_Per_Week",
+                    "Any_Anomaly",
+                ]
+                st.dataframe(
+                    anomaly_rows[anomaly_display_cols],
+                    use_container_width=True,
+                    hide_index=True
+                )
+                st.download_button(
+                    "⬇️ Download Anomaly Rows CSV",
+                    to_csv_download(anomaly_rows),
+                    file_name="lane_anomaly_rows.csv",
+                    mime="text/csv",
+                    use_container_width=True,
+                    key="dl_lane_anomaly_rows"
+                )
+
+        except Exception as e:
+            st.error(f"Could not process lane file: {e}")
